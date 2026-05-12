@@ -8,6 +8,7 @@ struct WavFile<'a> {
     path: &'a str,
 }
 
+#[derive(Copy, Clone)]
 struct Sample {
     left: u16,
     right: u16,
@@ -22,6 +23,7 @@ impl Sample {
             .to_vec()
             .into_flattened()
     }
+
 }
 
 struct Samples {
@@ -36,11 +38,62 @@ impl Samples {
             .flatten()
             .collect()
     }
+
+    fn join(a: Samples, b: Samples) -> Samples {
+        Samples {
+            data: a.data.into_iter().chain(b.data).collect()
+        }
+    }
+
+    fn range(&self, start: usize, end: usize) -> Samples {
+        Samples { 
+            data: self.data[start..end].to_vec(),
+        }
+    }
+
+    fn first_half(&self) -> Samples {
+        self.range(0, self.data.len() / 2)
+    }
+
+    fn second_half(&self) -> Samples {
+        self.range(self.data.len() / 2, self.data.len())
+    }
+
+    fn split_even(&self) -> (Samples, Samples) {
+        (self.first_half(), self.second_half())
+    }
+
+    fn doubled_up(mut self) -> Self {
+        self.data = self.data
+            .iter()
+            .flat_map(| x | { vec![*x, *x] })
+            .collect();
+        self
+    }
+
+    fn double_up(&mut self) {
+        self.data = self.data
+            .iter()
+            .flat_map(| x | { vec![*x, *x] })
+            .collect();
+    }
+
+    fn mute_channel(&mut self, chan: Channel) {
+        self.data
+            .iter_mut()
+            .for_each(| s | {
+                match chan {
+                    Channel::Left => s.left = 0,
+                    Channel::Right => s.right = 0,
+                }
+            });
+    }
+
 }
 
 
-impl From<[u8; 4]> for Sample {
-    fn from(value: [u8; 4]) -> Self {
+impl From<&[u8; 4]> for Sample {
+    fn from(value: &[u8; 4]) -> Self {
         Sample {
             left: u16::from_le_bytes([value[0], value[1]]),
             right: u16::from_le_bytes([value[2], value[3]]),
@@ -50,21 +103,18 @@ impl From<[u8; 4]> for Sample {
 
 impl <'a>From<&WavFile<'a>> for Samples {
     fn from(value: &WavFile) -> Self {
-        let data = value.data_ref();
-        
-        let data_samples = data
+        let data_samples = value
+            .data_ref()
             .chunks_exact(4)
             .map(| x | {
                 let val: [u8; 4] = x.try_into().unwrap();
-                Sample::from(val)
+                Sample::from(&val)
             })
             .collect();
         
         Samples{
             data: data_samples,
         }
-
-
     }
 }
 
@@ -103,6 +153,15 @@ impl<'a> WavFile<'a> {
         &self.contents[44..]
     }
 
+    fn low_to_high(&mut self)  {
+        let samples = self.samples();
+        let (mut first, second) = samples.split_even();
+        first.double_up();
+        let full = Samples::join(first, second);
+        self.set_data(full.to_bytes());
+
+    }
+
     fn double_up_u16s(data: Vec<u16>) -> Vec<u16> {
         let mut new_data = vec![];
         data.iter().for_each(|x| {
@@ -130,39 +189,26 @@ impl<'a> WavFile<'a> {
     }
 
     fn half_freq(&mut self) {
-    
-        // double up samples from each channel
-        let left = Self::double_up_u16s(self.channel_u16(Channel::Left));
-        let right = Self::double_up_u16s(self.channel_u16(Channel::Right));
-        // merge channels into new byte vector
-        let new_data: Vec<u8> = Self::merge_channels(left, right);
-        // set data
-        self.set_data(new_data);
+        self.set_data(self.samples().doubled_up().to_bytes());
     }
 
     fn set_data(&mut self, new_data: Vec<u8>) {
         let mut new_contents = Vec::from(self.header());
+        let new_len_bytes = new_data.len().to_le_bytes();
         new_contents.extend(new_data);
         self.contents = new_contents;
+        // set the new size within the header
+        new_len_bytes
+            .iter()
+            .enumerate()
+            .for_each(|(i, x)| self.contents[40 + i] = *x);
     }
 
 
     fn mute_channel(&mut self, chan:Channel) {
-        let should_mute = | i: usize | {
-            match chan {
-                Channel::Left => i % 4 < 2,
-                Channel::Right => i % 4 >= 2,
-            }
-        };
-        self
-            .data_mut()
-            .iter_mut()
-            .enumerate()
-            .for_each(|(i, x)| {
-                if should_mute(i) {
-                    *x = 0;
-                }
-            });
+        let mut samples = self.samples();
+        samples.mute_channel(chan);
+        self.set_data(samples.to_bytes());
     }
 
     fn add_noise(&mut self, val: u16) {
@@ -282,8 +328,9 @@ impl<'a> WavFile<'a> {
 async fn process_file() {
     
     let mut wav_file = WavFile::from_file("./Viola-C5.wav").await;
-    
-    wav_file.add_noise(22);
+        
+    wav_file.low_to_high();
+    // wav_file.mute_channel(Channel::Right);
 
     wav_file.write_to("new_file.wav").await;
 }
